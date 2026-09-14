@@ -1,0 +1,61 @@
+{
+  "model_file": "XAUUSD_v1789162398.pkl",
+  "trained_at": 1789162398,
+  "symbol": "XAUUSD",
+  "train_size": 314,
+  "test_size": 105,
+  "accuracy": 0.4476,
+  "auc": 0.5955,
+  "precision": 0.3291,
+  "recall": 0.8387,
+  "f1": 0.4727,
+  "baseline_wr": 0.2952,
+  "top_features": [
+    {
+      "name": "ema20_above_50",
+      "importance": 0.1081
+    },
+    {
+      "name": "range_14",
+      "importance": 0.0846
+    },
+    {
+      "name": "confidence",
+      "importance": 0.0764
+    },
+    {
+      "name": "return_20",
+      "importance": 0.0714
+    },
+    {
+      "name": "atr_pct",
+      "importance": 0.0694
+    },
+    {
+      "name": "adx",
+      "importance": 0.0686
+    },
+    {
+      "name": "dist_ema50_pct",
+      "importance": 0.0627
+    },
+    {
+      "name": "dist_ema20_pct",
+      "importance": 0.0533
+    },
+    {
+      "name": "hour_cos",
+      "importance": 0.051
+    },
+    {
+      "name": "hour",
+      "importance": 0.0493
+    }
+  ],
+  "confusion": {
+    "tn": 21,
+    "fp": 53,
+    "fn": 5,
+    "tp": 26
+  }
+}

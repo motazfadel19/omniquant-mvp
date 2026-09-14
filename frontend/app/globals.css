@@ -1,0 +1,35 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --font-jetbrains: "JetBrains Mono", monospace;
+  --font-inter: "Inter", system-ui;
+}
+
+html, body {
+  background: #08090d;
+  color: #e8ecf3;
+  font-family: var(--font-inter);
+  overflow: hidden;
+}
+
+* { box-sizing: border-box; }
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: #2a3140;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover { background: #3a4252; }
+
+.panel {
+  @apply bg-bg-panel border border-border rounded-lg;
+}
+
+.panel-title {
+  @apply text-[10px] font-semibold uppercase tracking-[0.15em] text-text-secondary px-3 py-2 border-b border-border;
+}
+
+.num { font-family: var(--font-jetbrains); font-variant-numeric: tabular-nums; }
