@@ -1,0 +1,5 @@
+# Windows only.
+# The MetaTrader5 python package drives the desktop terminal and does not
+# install on Linux/macOS — which is why it lives in its own file and why CI can
+# run the test suite without it.
+MetaTrader5==5.0.45

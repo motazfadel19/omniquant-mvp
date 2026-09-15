@@ -1,38 +1,54 @@
+"""
+AI engine: scans the watchlist, scores it with the SMC strategy, applies the
+risk guard, optionally filters with the ML model, then (only if explicitly
+armed) executes.
+
+Fixes vs v0.5
+  * every blocking MT5 call is pushed to a worker thread — the old version ran
+    them straight inside the asyncio loop and froze all WebSocket clients;
+  * the hardcoded `if signal != "BUY": return` is gone; direction filtering is
+    configuration (`ALLOWED_DIRECTIONS`);
+  * `max_concurrent` counted distinct SYMBOLS before, so it could never fire on
+    a single-symbol watchlist — it now counts positions via RiskGuard;
+  * the ML feature window is now the 50 candles STRICTLY BEFORE the signal bar,
+    matching training exactly (v0.5 fed it the signal bar itself: look-ahead);
+  * the kill switch is honoured before every order.
+"""
+from __future__ import annotations
+
 import asyncio
 import time
 from dataclasses import asdict
 from typing import Optional
 
-from mt5_bridge import (
-    get_candles, open_market_order, get_positions,
-    get_symbol_info, get_tick, get_account,
-)
-from database import insert_signal, get_conn
+from core.config import get_settings
+from database import audit, insert_signal, last_signal_time
+from mt5_bridge import (get_candles, get_positions, get_symbol_info,
+                        get_account, open_market_order)
+from risk import RiskGuard
 from strategy.smc import analyze_symbol
-
-
-DEFAULT_SYMBOLS = ["XAUUSD"]
 
 
 class AIEngine:
     def __init__(self):
+        self.s = get_settings()
+        self.risk = RiskGuard(self.s)
+
         self.running = False
         self.auto_execute = False
-        self.min_confidence = 0.30
-        self.symbols: list[str] = list(DEFAULT_SYMBOLS)
-        self.lot_size = 0.01
-        self.max_concurrent = 3
-        self.interval_sec = 60
+        self.symbols: list[str] = list(self.s.stream_symbols)
+        self.lot_size = self.s.default_lot_size
+        self.min_confidence = self.s.min_confidence
+        self.interval_sec = self.s.ai_interval_sec
 
         # ML settings
-        self.use_ml = False           # يُفعّل بعد تدريب النموذج
-        self.ml_threshold = 0.65      # عتبة ML للتنفيذ
-        self.ml_available = False     # يُحدَّث عند أول tick
-        self.ml_metrics: dict = {}    # metrics من آخر نموذج
+        self.use_ml = self.s.use_ml
+        self.ml_threshold = self.s.ml_threshold
+        self.ml_available = False
+        self.ml_metrics: dict = {}
 
         self.last_analysis: dict[str, dict] = {}
         self.recent_decisions: list[dict] = []
-        self._force_tick = False
 
         self.stats = {
             "signals_generated": 0,
@@ -44,28 +60,31 @@ class AIEngine:
             "rule_executions": 0,
         }
 
-        # محاولة تحميل النموذج
         self._try_load_ml()
 
-    # ---------------- ML Loader ----------------
+    # ---------------- ML ----------------
 
-    def _try_load_ml(self):
-        """يحاول تحميل النموذج المدرّب. إذا لم يوجد، يتجاهل."""
+    def _try_load_ml(self) -> None:
         try:
             from ml.predictor import load_model
-            model, meta = load_model("XAUUSD")
-            if model is not None:
-                self.ml_available = True
-                self.ml_metrics = meta.get("metrics", {})
-                print(f"[ML] model loaded | AUC={self.ml_metrics.get('auc', '?')}")
+            model, meta = load_model("XAUUSD", refresh=True)
+            self.ml_available = model is not None
+            self.ml_metrics = (meta or {}).get("metrics", {})
+            if self.ml_available:
+                print(f"[ML] model loaded | AUC={self.ml_metrics.get('auc', '?')} "
+                      f"p={self.ml_metrics.get('auc_permutation_p_value', '?')}")
             else:
-                print("[ML] no trained model found — running in rule-based mode")
+                print("[ML] no usable model — running rule-based")
         except ImportError:
-            print("[ML] ml module not installed — skipping")
+            print("[ML] ml dependencies missing — running rule-based")
         except Exception as e:
             print(f"[ML] load failed: {e}")
 
-    # ---------------- Config ----------------
+    def reload_ml(self) -> dict:
+        self._try_load_ml()
+        return {"ml_available": self.ml_available, "metrics": self.ml_metrics}
+
+    # ---------------- status / config ----------------
 
     def get_status(self) -> dict:
         return {
@@ -74,128 +93,113 @@ class AIEngine:
             "min_confidence": self.min_confidence,
             "symbols": self.symbols,
             "lot_size": self.lot_size,
-            "max_concurrent": self.max_concurrent,
             "interval_sec": self.interval_sec,
             "use_ml": self.use_ml,
             "ml_available": self.ml_available,
             "ml_threshold": self.ml_threshold,
             "ml_metrics": self.ml_metrics,
+            "trading_mode": self.s.trading_mode,
+            "allowed_directions": self.s.allowed_directions or ["BUY", "SELL"],
             "stats": self.stats,
         }
 
-    def update_config(self, payload: dict):
-        for k in ("min_confidence", "lot_size", "max_concurrent",
-                  "interval_sec", "ml_threshold"):
-            if k in payload:
+    def update_config(self, payload: dict) -> None:
+        for k in ("min_confidence", "lot_size", "interval_sec", "ml_threshold"):
+            if k in payload and payload[k] is not None:
                 setattr(self, k, payload[k])
         if "use_ml" in payload:
             self.use_ml = bool(payload["use_ml"])
-            print(f"[ML] use_ml = {self.use_ml}")
-        if "symbols" in payload and isinstance(payload["symbols"], list):
-            self.symbols = payload["symbols"]
+        if "symbols" in payload and isinstance(payload["symbols"], list) and payload["symbols"]:
+            self.symbols = [s.upper() for s in payload["symbols"]]
 
-    # ---------------- Controls ----------------
+    # ---------------- controls ----------------
 
-    def start(self):
+    def start(self) -> None:
         self.running = True
-        self._force_tick = True
-        print("[>>] [AI] engine started (immediate tick requested)")
 
-    def stop(self):
+    def stop(self) -> None:
         self.running = False
-        print("[STOP] [AI] engine stopped")
 
-    def set_auto(self, enabled: bool):
+    def set_auto(self, enabled: bool) -> None:
+        if enabled and not self.s.live:
+            print("[AI] auto-execute requested but TRADING_MODE=paper — "
+                  "orders will be simulated only")
         self.auto_execute = bool(enabled)
-        print(f"[FAST] [AI] auto-execute = {self.auto_execute}")
 
-    def reload_ml(self):
-        """يُعيد تحميل النموذج (بعد تدريب جديد)."""
-        self._try_load_ml()
-        return {"ml_available": self.ml_available, "metrics": self.ml_metrics}
+    # ---------------- loop ----------------
 
-    # ---------------- Main loop ----------------
-
-    async def run_loop(self):
-        print("[AI] main loop started")
+    async def run_loop(self) -> None:
+        print("[AI] loop started")
         while True:
             try:
                 if self.running:
-                    if self._force_tick:
-                        self._force_tick = False
-                        print("[FAST] [AI] executing forced tick")
-                        await self._tick()
-                        await asyncio.sleep(self.interval_sec)
-                    else:
-                        await self._tick()
-                        await asyncio.sleep(self.interval_sec)
+                    await self._tick()
+                    await asyncio.sleep(self.interval_sec)
                 else:
                     await asyncio.sleep(2)
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 self.stats["errors"] += 1
                 print(f"[X] [AI] loop error: {e}")
-                import traceback
-                traceback.print_exc()
                 await asyncio.sleep(5)
 
-    async def _tick(self):
+    async def _tick(self) -> None:
         self.stats["last_run"] = int(time.time())
-        print(f"[AI] --- analysis cycle ({len(self.symbols)} symbols) ---")
 
-        open_positions = get_positions() or []
-        open_syms = {p["symbol"] for p in open_positions}
-        print(f"   open positions: {len(open_positions)} | symbols: {sorted(open_syms)}")
+        positions = await asyncio.to_thread(get_positions) or []
+        account = await asyncio.to_thread(get_account)
+        print(f"[AI] cycle | {len(positions)} open position(s)")
+
+        killed, why = self.risk.killed()
+        if killed:
+            print(f"[STOP] [AI] kill switch engaged ({why}) — analysis only, no orders")
 
         for sym in self.symbols:
             try:
-                await self._analyze_and_decide(sym, open_syms)
+                await self._analyze_and_decide(sym, positions, account, killed)
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 self.stats["errors"] += 1
                 print(f"   [X] {sym}: {e}")
-                import traceback
-                traceback.print_exc()
 
-        print(f"[AI] --- cycle complete ---")
-
-    async def _analyze_and_decide(self, symbol: str, open_syms: set):
-        candles = get_candles(symbol, "H1", 200)
+    async def _analyze_and_decide(self, symbol: str, positions: list[dict],
+                                  account: Optional[dict], killed: bool) -> None:
+        candles = await asyncio.to_thread(get_candles, symbol, "H1", 220)
         if not candles or len(candles) < 60:
-            print(f"   [!] {symbol}: only {len(candles) if candles else 0} candles")
+            print(f"   [!] {symbol}: no candles")
             return
 
-        result = analyze_symbol(symbol, candles)
+        # thresholds come from the same settings object the backtest uses
+        result = await asyncio.to_thread(
+            analyze_symbol, symbol, candles,
+            sl_atr_mult=self.s.sl_atr_mult,
+            tp_atr_mult=self.s.tp_atr_mult,
+            min_score=self.s.min_score,
+            min_confluences=self.s.min_confluences,
+            stronger_by=self.s.stronger_by,
+        )
 
-        # حفظ آخر تحليل للعرض
-        analysis_dict = asdict(result)
         self.last_analysis[symbol] = {
             "symbol": symbol,
-            "signal": analysis_dict.get("signal"),
-            "price": float(analysis_dict.get("price", 0)),
-            "sl": float(analysis_dict.get("sl", 0)),
-            "tp": float(analysis_dict.get("tp", 0)),
-            "confidence": float(analysis_dict.get("confidence", 0)),
-            "reasons": list(analysis_dict.get("reasons", [])),
-            "confluences": dict(analysis_dict.get("confluences", {})),
-            "indicators": dict(analysis_dict.get("indicators", {})),
-            "timestamp": int(analysis_dict.get("timestamp", 0)),
+            "signal": result.signal,
+            "price": float(result.price),
+            "sl": float(result.sl),
+            "tp": float(result.tp),
+            "confidence": float(result.confidence),
+            "reasons": list(result.reasons),
+            "confluences": dict(result.confluences),
+            "indicators": dict(result.indicators),
+            "timestamp": int(result.timestamp),
         }
 
-        adx_val = result.indicators.get("adx", 0)
-        print(f"   {'[TARGET]' if result.signal else '  '} {symbol:8} "
-              f"signal={str(result.signal or '-'):5} "
-              f"conf={result.confidence:.2f} "
-              f"adx={adx_val}")
+        print(f"   {symbol:8} signal={str(result.signal or '-'):5} "
+              f"conf={result.confidence:.2f} adx={result.indicators.get('adx', 0)}")
 
         if not result.signal:
             return
 
-        # ✅ BUY فقط (بناءً على Backtest)
-        if result.signal != "BUY":
-            return
-
-        self.stats["signals_generated"] += 1
-
-        # بناء القرار
         decision = {
             "symbol": symbol,
             "direction": result.signal,
@@ -210,40 +214,42 @@ class AIEngine:
             "ml_score": None,
         }
 
-        # فحص المخاطر
-        rejected = self._risk_check(symbol, result, open_syms)
-        if rejected:
-            decision["reason_rejected"] = rejected
+        # ---------- risk gate (server side, always) ----------
+        info = await asyncio.to_thread(get_symbol_info, symbol)
+        verdict = self.risk.check(
+            symbol=symbol,
+            direction=result.signal,
+            volume=self.lot_size,
+            positions=positions,
+            account=account,
+            symbol_info=info,
+            last_signal_ts=last_signal_time(symbol),
+        )
+        if not verdict:
+            decision["reason_rejected"] = verdict.reason
             self.stats["signals_rejected"] += 1
-            print(f"      [REJECT] {rejected}")
+            print(f"      [REJECT] {verdict.reason}")
             self._push_decision(decision)
             return
 
-        # حفظ الإشارة في DB
+        self.stats["signals_generated"] += 1
+
         try:
-            insert_signal(
-                symbol=symbol,
-                direction=result.signal,
-                price=result.price,
-                sl=result.sl,
-                tp=result.tp,
-                confidence=result.confidence,
-                source="ai-engine",
-            )
-            print(f"      [DB] signal saved")
+            insert_signal(symbol, result.signal, result.price, result.sl,
+                          result.tp, result.confidence, "ai-engine")
         except Exception as e:
             print(f"      [!] insert_signal failed: {e}")
 
-        # ============ ML Prediction ============
+        # ---------- ML filter ----------
         ml_score = None
         if self.ml_available:
             try:
                 from ml.predictor import predict_quality
-                candles_before = candles[-50:] if len(candles) >= 50 else candles
+                candles_before = candles[-51:-1]      # strictly before the signal bar
                 ml_score = predict_quality(
                     {
                         "entry_price": result.price,
-                        "signal_time": result.timestamp,
+                        "signal_time": int(candles[-1]["time"]),
                         "direction": result.signal,
                         "confidence": result.confidence,
                         "bull_score": result.indicators.get("bull_score", 0),
@@ -256,29 +262,24 @@ class AIEngine:
                 )
                 if ml_score is not None:
                     decision["ml_score"] = round(ml_score, 3)
-                    print(f"      [ML] score = {ml_score:.3f}")
+                    print(f"      [ML] score={ml_score:.3f}")
             except Exception as e:
                 print(f"      [!] ML prediction failed: {e}")
 
-        # ============ Decision ============
-
-        # تحديد إذا نُنفّذ
+        # ---------- decision ----------
         rule_ok = result.confidence >= self.min_confidence
-        ml_ok = (
-            self.use_ml
-            and self.ml_available
-            and ml_score is not None
-            and ml_score >= self.ml_threshold
-        )
+        ml_ok = (self.use_ml and self.ml_available
+                 and ml_score is not None and ml_score >= self.ml_threshold)
 
-        # في وضع ML: يجب أن يوافق ML
-        # في وضع Rule: يكفي rule
         if self.use_ml and self.ml_available:
-            execute = self.auto_execute and ml_ok
-            source = "ML"
+            execute, source = (self.auto_execute and ml_ok), "ML"
         else:
-            execute = self.auto_execute and rule_ok
-            source = "RULE"
+            execute, source = (self.auto_execute and rule_ok), "RULE"
+
+        if execute and killed:
+            decision["reason_rejected"] = "kill switch engaged"
+            self._push_decision(decision)
+            return
 
         if execute:
             decision["execution_source"] = source
@@ -286,42 +287,20 @@ class AIEngine:
                 self.stats["ml_executions"] += 1
             else:
                 self.stats["rule_executions"] += 1
-            await self._execute(decision)
+            await self._execute(decision, info)
         else:
             if self.auto_execute:
-                reason = "ml_below_threshold" if self.use_ml else "rule_below_threshold"
-                decision["reason_rejected"] = reason
+                decision["reason_rejected"] = (
+                    "ml_below_threshold" if self.use_ml else "rule_below_threshold")
             self._push_decision(decision)
 
-    # ---------------- Risk ----------------
+    # ---------------- execution ----------------
 
-    def _risk_check(self, symbol: str, result, open_syms: set) -> Optional[str]:
-        if len(open_syms) >= self.max_concurrent:
-            return f"max_concurrent ({self.max_concurrent}) reached"
-        if symbol in open_syms:
-            return "already have position on this symbol"
-
-        info = get_symbol_info(symbol)
-        if not info:
-            return "symbol info unavailable"
-        if info.get("trade_mode") == 0:
-            return "trading disabled"
-        if info.get("spread", 0) > 100:
-            return f"spread too high ({info['spread']})"
-
-        return None
-
-    # ---------------- Execution ----------------
-
-    async def _execute(self, decision: dict):
+    async def _execute(self, decision: dict, info: Optional[dict]) -> None:
         try:
-            info = get_symbol_info(decision["symbol"]) or {}
-            digits = info.get("digits", 5)
-            point = info.get("point", 0.00001)
-
-            price = decision["price"]
-            sl = decision["sl"]
-            tp = decision["tp"]
+            digits = (info or {}).get("digits", 5)
+            point = (info or {}).get("point", 0.00001)
+            price, sl, tp = decision["price"], decision["sl"], decision["tp"]
 
             if decision["direction"] == "BUY":
                 sl_points = int((price - sl) / point) if sl > 0 else 0
@@ -330,27 +309,39 @@ class AIEngine:
                 sl_points = int((sl - price) / point) if sl > 0 else 0
                 tp_points = int((price - tp) / point) if tp > 0 else 0
 
-            res = open_market_order(
+            # respect the broker's minimum stop distance, otherwise MT5 just rejects
+            stops_level = int((info or {}).get("stops_level", 0) or 0)
+            if stops_level:
+                sl_points = max(sl_points, stops_level + 1)
+                tp_points = max(tp_points, stops_level + 1)
+            if self.s.min_stop_points:
+                sl_points = max(sl_points, self.s.min_stop_points)
+                tp_points = max(tp_points, self.s.min_stop_points)
+
+            res = await asyncio.to_thread(
+                open_market_order,
                 symbol=decision["symbol"],
                 direction=decision["direction"],
                 volume=self.lot_size,
-                sl_points=max(0, sl_points),
-                tp_points=max(0, tp_points),
+                sl_points=sl_points,
+                tp_points=tp_points,
                 magic=777001,
                 comment="AIEngine",
             )
 
-            decision["executed"] = res.get("ok", False)
+            decision["executed"] = bool(res.get("ok"))
+            decision["ticket"] = res.get("ticket")
             if decision["executed"]:
                 self.stats["signals_executed"] += 1
-                ml_str = f" ML={decision.get('ml_score')}" if decision.get("ml_score") else ""
                 print(f"      [OK] EXECUTED {decision['direction']} "
-                      f"{decision['symbol']} @ {price}{ml_str}")
+                      f"{decision['symbol']} @ {res.get('price')} "
+                      f"(mode={self.s.trading_mode})")
             else:
                 decision["reason_rejected"] = (
-                    res.get("error") or res.get("comment") or "unknown"
-                )
+                    res.get("error") or res.get("comment") or "unknown")
                 print(f"      [X] exec failed: {decision['reason_rejected']}")
+
+            audit("ai-engine", "order.open", decision["symbol"], decision, res)
         except Exception as e:
             decision["reason_rejected"] = str(e)
             self.stats["errors"] += 1
@@ -358,9 +349,9 @@ class AIEngine:
 
         self._push_decision(decision)
 
-    # ---------------- Decisions Log ----------------
+    # ---------------- log ----------------
 
-    def _push_decision(self, decision: dict):
+    def _push_decision(self, decision: dict) -> None:
         self.recent_decisions.insert(0, decision)
         self.recent_decisions = self.recent_decisions[:100]
 
@@ -371,5 +362,4 @@ class AIEngine:
         return self.last_analysis
 
 
-# Singleton
 ai_engine = AIEngine()

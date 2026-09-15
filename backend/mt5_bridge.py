@@ -1,6 +1,21 @@
+"""
+Thin wrapper around the MetaTrader5 package.
+
+Two rules added in v0.6:
+  * TRADING_MODE=paper never reaches the broker — order functions return a
+    simulated fill and log it, so you can exercise the whole stack safely;
+  * every order attempt (paper or live) is written to the audit log.
+"""
+import time
+
 import MetaTrader5 as mt5
 import pandas as pd
 from datetime import datetime
+
+from core.config import get_settings
+from database import audit
+
+PAPER_TICKET_BASE = 9_000_000
 
 TIMEFRAME_MAP = {
     "M1":  mt5.TIMEFRAME_M1,
@@ -130,6 +145,28 @@ def get_quote(symbol: str) -> dict | None:
     }
 
 
+# ==================== PAPER MODE ====================
+
+def _paper_fill(kind: str, payload: dict) -> dict:
+    """Simulated broker response. Never touches the terminal."""
+    ticket = PAPER_TICKET_BASE + int(time.time() % 1_000_000)
+    res = {
+        "ok": True,
+        "paper": True,
+        "ticket": ticket,
+        "deal": ticket,
+        "price": payload.get("price", 0.0),
+        "volume": payload.get("volume", 0.0),
+        "sl": payload.get("sl", 0.0),
+        "tp": payload.get("tp", 0.0),
+        "retcode": 10009,          # TRADE_RETCODE_DONE
+        "comment": "PAPER fill — no order was sent to the broker",
+    }
+    audit("system", f"paper.{kind}", payload.get("symbol", ""), payload, res)
+    print(f"[PAPER] {kind}: {payload}")
+    return res
+
+
 # ==================== ORDER EXECUTION ====================
 
 def _get_filling_mode(symbol: str) -> int:
@@ -198,6 +235,9 @@ def open_market_order(
         "type_filling": _get_filling_mode(symbol),
     }
 
+    if not get_settings().live:
+        return _paper_fill("open", {**request, "sl": sl, "tp": tp})
+
     result = mt5.order_send(request)
     if result is None:
         return {"ok": False, "error": f"order_send returned None: {mt5.last_error()}"}
@@ -244,6 +284,9 @@ def close_position(ticket: int) -> dict:
         "type_filling": _get_filling_mode(pos.symbol),
     }
 
+    if not get_settings().live:
+        return _paper_fill("close", {**request, "profit": pos.profit})
+
     result = mt5.order_send(request)
     if result is None:
         return {"ok": False, "error": f"order_send returned None: {mt5.last_error()}"}
@@ -288,6 +331,9 @@ def modify_position(ticket: int, sl_points: float, tp_points: float) -> dict:
         "tp":       round(tp, sym_info.digits),
         "magic":    pos.magic,
     }
+
+    if not get_settings().live:
+        return _paper_fill("modify", {**request, "ticket": ticket})
 
     result = mt5.order_send(request)
     if result is None:

@@ -1,95 +1,91 @@
 """
-Feature Engineering — يحوّل كل إشارة إلى مصفوفة أرقام.
+Feature engineering: turn one signal + its preceding candles into a feature row.
+
+Fixes vs v0.5
+  * `datetime.utcfromtimestamp` (deprecated, removed in 3.12+) replaced by an
+    explicit UTC conversion;
+  * `ema20` / `ema50` were plain SMAs — renamed so the model report stops lying;
+  * the returned dict is guaranteed to contain every column in FEATURE_COLUMNS
+    (v0.5 returned short rows whenever a window was too small, which silently
+    produced NaNs downstream).
 """
+from datetime import datetime, timezone
+
 import numpy as np
-from datetime import datetime
 
 
-def extract_features(trade_row: dict, candles_before: list[dict]) -> dict:
+def extract_features(trade_row: dict, candles_before: list[dict]) -> dict | None:
     """
-    يستخرج ميزات إشارة واحدة.
-    
     Args:
-        trade_row: dict من backtest_trades
-        candles_before: قائمة شموع قبل الإشارة (آخر 50)
-    
-    Returns:
-        dict من الميزات
+        trade_row: a row from `backtest_trades` (or the live signal dict).
+        candles_before: candles STRICTLY BEFORE the signal bar (50 is ideal).
+
+    Returns None when there is not enough context to build a row.
     """
     if not candles_before or len(candles_before) < 20:
         return None
 
-    closes = np.array([c["close"] for c in candles_before], dtype=float)
-    highs = np.array([c["high"] for c in candles_before], dtype=float)
-    lows = np.array([c["low"] for c in candles_before], dtype=float)
-    volumes = np.array([c.get("tick_volume", 0) for c in candles_before], dtype=float)
+    closes = np.array([float(c["close"]) for c in candles_before], dtype=float)
+    highs = np.array([float(c["high"]) for c in candles_before], dtype=float)
+    lows = np.array([float(c["low"]) for c in candles_before], dtype=float)
+    volumes = np.array([float(c.get("tick_volume", c.get("volume", 0)) or 0)
+                        for c in candles_before], dtype=float)
 
-    price = trade_row["entry_price"]
-    atr = trade_row.get("atr", 0) or 0.01
-    ts = trade_row["signal_time"]
+    price = float(trade_row["entry_price"])
+    atr = float(trade_row.get("atr", 0) or 0.01)
+    ts = int(trade_row.get("signal_time", 0) or 0)
 
-    dt = datetime.utcfromtimestamp(ts)
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc) if ts else datetime.now(timezone.utc)
 
-    # === ميزات من الإشارة ===
     features = {
-        "confidence": trade_row.get("confidence", 0),
-        "bull_score": trade_row.get("bull_score", 0),
-        "bear_score": trade_row.get("bear_score", 0),
-        "adx": trade_row.get("adx", 0),
-        "rsi": trade_row.get("rsi", 50),
-        "atr_pct": (atr / price * 100) if price else 0,
-        "direction_buy": 1 if trade_row["direction"] == "BUY" else 0,
+        "confidence": float(trade_row.get("confidence", 0) or 0),
+        "bull_score": float(trade_row.get("bull_score", 0) or 0),
+        "bear_score": float(trade_row.get("bear_score", 0) or 0),
+        "adx": float(trade_row.get("adx", 0) or 0),
+        "rsi": float(trade_row.get("rsi", 50) or 50),
+        "atr_pct": (atr / price * 100) if price else 0.0,
+        "direction_buy": 1 if str(trade_row.get("direction", "BUY")).upper() == "BUY" else 0,
     }
 
-    # === ميزات زمنية ===
+    # ---- time features (broker server time — consistent train/live per broker) ----
     features["hour"] = dt.hour
     features["day_of_week"] = dt.weekday()
-    features["hour_sin"] = np.sin(2 * np.pi * dt.hour / 24)
-    features["hour_cos"] = np.cos(2 * np.pi * dt.hour / 24)
+    features["hour_sin"] = float(np.sin(2 * np.pi * dt.hour / 24))
+    features["hour_cos"] = float(np.cos(2 * np.pi * dt.hour / 24))
 
-    # === ميزات من السياق ===
-    # العائد خلال آخر 5 / 10 / 20 شمعة
-    if len(closes) >= 6:
-        features["return_5"] = (price - closes[-6]) / closes[-6] * 100
-    else:
-        features["return_5"] = 0
+    # ---- momentum ----
+    for window in (5, 10, 20):
+        key = f"return_{window}"
+        features[key] = ((price - closes[-(window + 1)]) / closes[-(window + 1)] * 100
+                         if len(closes) >= window + 1 else 0.0)
 
-    if len(closes) >= 11:
-        features["return_10"] = (price - closes[-11]) / closes[-11] * 100
-    else:
-        features["return_10"] = 0
+    # ---- distance from moving averages ----
+    sma20 = float(closes[-20:].mean()) if len(closes) >= 20 else float(closes.mean())
+    sma50 = float(closes[-50:].mean()) if len(closes) >= 50 else float(closes.mean())
+    features["dist_sma20_pct"] = (price - sma20) / sma20 * 100 if sma20 else 0.0
+    features["dist_sma50_pct"] = (price - sma50) / sma50 * 100 if sma50 else 0.0
+    features["sma20_above_50"] = 1 if sma20 > sma50 else 0
 
-    if len(closes) >= 21:
-        features["return_20"] = (price - closes[-21]) / closes[-21] * 100
-    else:
-        features["return_20"] = 0
-
-    # المسافة عن EMA20 / EMA50
-    ema20 = closes[-20:].mean() if len(closes) >= 20 else closes.mean()
-    ema50 = closes[-50:].mean() if len(closes) >= 50 else closes.mean()
-
-    features["dist_ema20_pct"] = (price - ema20) / ema20 * 100
-    features["dist_ema50_pct"] = (price - ema50) / ema50 * 100
-    features["ema20_above_50"] = 1 if ema20 > ema50 else 0
-
-    # التقلب (ATR / range)
+    # ---- volatility ----
     if len(highs) >= 14:
-        recent_range = highs[-14:].max() - lows[-14:].min()
-        features["range_14"] = recent_range / price * 100 if price else 0
+        recent_range = float(highs[-14:].max() - lows[-14:].min())
+        features["range_14"] = recent_range / price * 100 if price else 0.0
 
-    # حجم
+    # ---- volume ----
     if len(volumes) >= 20:
-        vol_avg = volumes[-20:].mean()
-        features["volume_ratio"] = volumes[-1] / vol_avg if vol_avg > 0 else 1
+        vol_avg = float(volumes[-20:].mean())
+        features["volume_ratio"] = float(volumes[-1] / vol_avg) if vol_avg > 0 else 1.0
 
-    # موقع السعر في نطاق آخر 20 شمعة
+    # ---- position inside the recent range ----
     if len(highs) >= 20:
-        h20 = highs[-20:].max()
-        l20 = lows[-20:].min()
+        h20, l20 = float(highs[-20:].max()), float(lows[-20:].min())
         rng = h20 - l20
         features["price_position"] = (price - l20) / rng if rng > 0 else 0.5
 
-    return features
+    # guarantee a complete, ordered row
+    for col in FEATURE_COLUMNS:
+        features.setdefault(col, 0.0)
+    return {col: float(features[col]) for col in FEATURE_COLUMNS}
 
 
 FEATURE_COLUMNS = [
@@ -97,6 +93,6 @@ FEATURE_COLUMNS = [
     "adx", "rsi", "atr_pct", "direction_buy",
     "hour", "day_of_week", "hour_sin", "hour_cos",
     "return_5", "return_10", "return_20",
-    "dist_ema20_pct", "dist_ema50_pct", "ema20_above_50",
+    "dist_sma20_pct", "dist_sma50_pct", "sma20_above_50",
     "range_14", "volume_ratio", "price_position",
 ]

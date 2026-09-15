@@ -1,15 +1,33 @@
-﻿node_modules/
-.next/
+# ---------------- Python ----------------
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.db
-.env
-.env.*
+*.py[cod]
+*.egg-info/
 .venv/
 venv/
-dist/
-build/
-coverage/
-logs/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ---------------- Local data & secrets ----------------
+.env
+.env.*
+!.env.example
+*.db
+*.db-wal
+*.db-shm
+backend/logs/
+
+# Trained models are build artefacts: regenerate them with `python -m ml.train`
+backend/ml/models/*.pkl
+backend/ml/models/*.json
+
+# ---------------- Frontend ----------------
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+
+# ---------------- OS ----------------
+.DS_Store
+Thumbs.db

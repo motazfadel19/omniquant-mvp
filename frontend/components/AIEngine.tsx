@@ -2,27 +2,10 @@
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { fmtTime } from "@/lib/format";
+import { api } from "@/lib/api";
 import {
   Brain, Play, Square, Zap, AlertTriangle, CheckCircle2, XCircle, Database,
 } from "lucide-react";
-
-const API = process.env.NEXT_PUBLIC_API_URL!;
-const TOKEN = process.env.NEXT_PUBLIC_AUTH_TOKEN || "dev-local-token-change-me";
-
-async function aiGet<T>(path: string): Promise<T> {
-  const r = await fetch(`${API}${path}`);
-  return r.json();
-}
-
-async function aiPost<T>(path: string, body: object = {}): Promise<T> {
-  const r = await fetch(`${API}${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Auth-Token": TOKEN },
-    body: JSON.stringify(body),
-  });
-  if (!r.ok) throw new Error((await r.json()).detail || `API ${r.status}`);
-  return r.json();
-}
 
 export default function AIEnginePanel() {
   const qc = useQueryClient();
@@ -32,40 +15,45 @@ export default function AIEnginePanel() {
 
   const { data: status } = useQuery({
     queryKey: ["ai-status"],
-    queryFn: () => aiGet<any>("/api/ai/status"),
+    queryFn: api.aiStatus,
     refetchInterval: 3000,
   });
 
   const { data: analysis } = useQuery({
     queryKey: ["ai-analysis"],
-    queryFn: () => aiGet<{ analysis: Record<string, any> }>("/api/ai/analysis"),
+    queryFn: api.aiAnalysis,
     refetchInterval: 5000,
   });
 
   const { data: decisions } = useQuery({
     queryKey: ["ai-decisions"],
-    queryFn: () => aiGet<{ decisions: any[] }>("/api/ai/decisions?limit=15"),
+    queryFn: () => api.aiDecisions(15),
     refetchInterval: 5000,
   });
 
   // ✅ اسم مختلف — لا تعارض
   const { data: dataStats } = useQuery({
     queryKey: ["data-stats"],
-    queryFn: () => aiGet<any>("/api/data/stats"),
+    queryFn: api.dataStats,
     refetchInterval: 30_000,
   });
 
   // ==== Mutations ====
 
+  const { data: risk } = useQuery({
+    queryKey: ["risk-status-ai"],
+    queryFn: api.riskStatus,
+    refetchInterval: 10_000,
+  });
+
   const toggle = useMutation({
-    mutationFn: (running: boolean) =>
-      aiPost(`/api/ai/${running ? "stop" : "start"}`),
+    mutationFn: (running: boolean) => (running ? api.aiStop() : api.aiStart()),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["ai-status"] }),
   });
 
   const toggleAuto = useMutation({
     mutationFn: (enabled: boolean) =>
-      aiPost("/api/ai/auto-execute", { enabled }),
+      api.aiAuto(enabled),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["ai-status"] });
       setConfirmAuto(false);
@@ -164,7 +152,7 @@ export default function AIEnginePanel() {
                 ML Data
               </span>
               <span className="text-[10px] num text-text-secondary">
-                {dataStats.signals ?? 0}/{500}
+                {dataStats.backtest_trades ?? 0}/{dataStats.ml_min_samples ?? 1000}
               </span>
             </div>
             <div className="h-1 bg-bg-base rounded-full overflow-hidden">
@@ -177,19 +165,10 @@ export default function AIEnginePanel() {
             </div>
             <div className="flex items-center justify-between mt-1 text-[9px] text-text-muted">
               <span>
-                Trades: <span className="num">{dataStats.trades ?? 0}</span>
+                Signals: <span className="num">{dataStats.signals ?? 0}</span>
               </span>
               <span>
-                WinRate:{" "}
-                <span
-                  className={`num ${
-                    (dataStats.win_rate ?? 0) >= 50
-                      ? "text-accent-green"
-                      : "text-accent-red"
-                  }`}
-                >
-                  {dataStats.win_rate ?? 0}%
-                </span>
+                Live trades: <span className="num">{dataStats.trades ?? 0}</span>
               </span>
               <span>
                 Candles:{" "}
@@ -309,14 +288,31 @@ export default function AIEnginePanel() {
               .
               <br />
               <br />
-              Max concurrent: <strong>{status?.max_concurrent ?? 3}</strong>{" "}
-              positions
+              Max concurrent:{" "}
+              <strong>{risk?.limits?.max_concurrent_positions ?? "—"}</strong> positions
               <br />
               Lot size: <strong>{status?.lot_size ?? 0.01}</strong>
               <br />
+              Mode:{" "}
+              <strong
+                className={
+                  status?.trading_mode === "live"
+                    ? "text-accent-red"
+                    : "text-accent-green"
+                }
+              >
+                {String(status?.trading_mode ?? "?").toUpperCase()}
+              </strong>
               <br />
-              <span className="text-accent-red">This trades real money.</span>{" "}
-              Test on demo first.
+              <br />
+              {status?.trading_mode === "live" ? (
+                <span className="text-accent-red">This trades real money.</span>
+              ) : (
+                <span className="text-accent-green">
+                  Paper mode: orders are simulated, nothing reaches the broker.
+                </span>
+              )}{" "}
+              Always test on demo first.
             </div>
             <div className="flex justify-end gap-2">
               <button

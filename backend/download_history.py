@@ -5,14 +5,24 @@
 import time
 from datetime import datetime, timezone
 
+import os
+from datetime import datetime, timezone
+
 import MetaTrader5 as mt5
 
+from core.config import get_settings
 from mt5_bridge import init_mt5
 from database import init_db, save_candles
 
+S = get_settings()
 
-SYMBOLS = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD"]
-TIMEFRAMES = ["H1"]   # ابدأ بـ H1 فقط (أسرع)
+# More symbols and more timeframes = more ways to falsify the strategy.
+SYMBOLS = sorted(set(
+    S.stream_symbols + ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD"]
+))
+TIMEFRAMES = [t.strip().upper() for t in
+              os.getenv("HISTORY_TIMEFRAMES", "H1,H4").split(",") if t.strip()]
+START_DATE = os.getenv("HISTORY_START", "2024-01-01")
 
 
 def download_symbol(symbol: str, timeframe: str):
@@ -27,11 +37,11 @@ def download_symbol(symbol: str, timeframe: str):
     }
     tf = tf_map[timeframe]
 
-    # من 2025-01-01 حتى الآن
-    from_dt = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    year, month, day = (int(x) for x in START_DATE.split("-"))
+    from_dt = datetime(year, month, day, tzinfo=timezone.utc)
     to_dt = datetime.now(timezone.utc)
 
-    print(f"  {symbol} {timeframe}: fetching from 2025-01-01...")
+    print(f"  {symbol} {timeframe}: fetching from {START_DATE}...")
 
     rates = mt5.copy_rates_range(symbol, tf, from_dt, to_dt)
     if rates is None or len(rates) == 0:
@@ -61,7 +71,8 @@ def main():
 
     total = 0
     print("=" * 60)
-    print("Downloading history from 2025-01-01")
+    print(f"Downloading {','.join(TIMEFRAMES)} history from {START_DATE}")
+    print(f"Symbols: {', '.join(SYMBOLS)}")
     print("=" * 60)
 
     for symbol in SYMBOLS:

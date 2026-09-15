@@ -1,3 +1,15 @@
+"""
+OmniQuant MVP — FastAPI backend.
+
+v0.6 changes
+  * risk guard + kill switch + paper/live mode are enforced server-side;
+  * the backtest exposes expectancy / drawdown / Sharpe / walk-forward /
+    Monte-Carlo instead of a bare win rate;
+  * nothing blocking runs inside the event loop any more;
+  * every order attempt is journalled.
+"""
+from __future__ import annotations
+
 import asyncio
 import json
 import os
@@ -6,51 +18,50 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Header, HTTPException, Depends
+from fastapi import (Depends, FastAPI, Header, HTTPException, Query, WebSocket,
+                     WebSocketDisconnect)
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from database import (
-    init_db, save_candles, insert_signal,
-    get_recent_signals, get_conn
-)
-from mt5_bridge import (
-    init_mt5, shutdown_mt5, get_candles, get_tick,
-    get_account, get_positions, get_symbols,
-    get_symbol_info, get_quote,
-    open_market_order, close_position, modify_position, close_all_positions,
-)
 from analyzer import ai_engine
-from backtest import run_backtest, get_backtest_stats, get_backtest_trades
-
+from backtest.engine import BacktestConfig, run_backtest
+from backtest.metrics import compute_metrics
+from backtest.montecarlo import random_benchmark
+from backtest.walkforward import walk_forward
+from core.config import get_settings
+from database import (get_backtest_trades, get_conn, get_recent_signals,
+                      init_db, insert_signal, recent_audit, save_candles)
+from mt5_bridge import (close_all_positions, close_position, get_account,
+                        get_candles, get_positions, get_quote, get_symbol_info,
+                        get_symbols, get_tick, init_mt5, modify_position,
+                        open_market_order, shutdown_mt5)
+from risk import risk_guard
 
 load_dotenv()
 
-AUTH_TOKEN = os.getenv("AUTH_TOKEN", "dev-local-token-change-me")
-MAX_LOT_SIZE = float(os.getenv("MAX_LOT_SIZE", "0.5"))
-ALLOWED_SYMBOLS = set(
-    s.strip() for s in os.getenv("ALLOWED_SYMBOLS", "").split(",") if s.strip()
+S = get_settings()
+
+CORS_REGEX = os.getenv(
+    "CORS_ORIGIN_REGEX",
+    r"https?://(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?",
 )
 
-STREAM_SYMBOLS = ["XAUUSD"]
-HEATMAP_SYMBOLS = ["XAUUSD"]
 
-
-# ==================== WEBSOCKET MANAGER ====================
+# ==================== WEBSOCKET ====================
 
 class ConnectionManager:
     def __init__(self):
         self.active: list[WebSocket] = []
 
-    async def connect(self, ws: WebSocket):
+    async def connect(self, ws: WebSocket) -> None:
         await ws.accept()
         self.active.append(ws)
 
-    def disconnect(self, ws: WebSocket):
+    def disconnect(self, ws: WebSocket) -> None:
         if ws in self.active:
             self.active.remove(ws)
 
-    async def broadcast(self, msg: dict):
+    async def broadcast(self, msg: dict) -> None:
         dead = []
         for ws in self.active:
             try:
@@ -65,23 +76,30 @@ manager = ConnectionManager()
 _last_candle_time: dict[str, int] = {}
 
 
-async def market_streamer():
-    """بث حي — tick + شموع جديدة."""
+async def market_streamer() -> None:
+    """Live tick + closed-candle broadcast. All MT5 calls run in a worker thread."""
     while True:
         try:
             if manager.active:
-                ticks = [get_tick(s) for s in STREAM_SYMBOLS]
-                ticks = [t for t in ticks if t]
+                ticks = []
+                for sym in S.stream_symbols:
+                    t = await asyncio.to_thread(get_tick, sym)
+                    if t:
+                        ticks.append(t)
+
+                account = await asyncio.to_thread(get_account)
+                positions = await asyncio.to_thread(get_positions)
+
                 await manager.broadcast({
                     "type": "tick",
                     "ticks": ticks,
-                    "account": get_account(),
-                    "positions": get_positions(),
+                    "account": account,
+                    "positions": positions,
                     "ts": int(time.time()),
                 })
 
-                for sym in STREAM_SYMBOLS:
-                    c = get_candles(sym, "H1", 2)
+                for sym in S.stream_symbols:
+                    c = await asyncio.to_thread(get_candles, sym, "H1", 2)
                     if not c:
                         continue
                     latest = c[-1]
@@ -93,71 +111,75 @@ async def market_streamer():
                             "timeframe": "H1",
                             "candle": latest,
                         })
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             print(f"streamer error: {e}")
-        await asyncio.sleep(1)
+        await asyncio.sleep(S.stream_interval_sec)
 
 
-async def prefetch_history():
-    """تحميل تاريخ عند بدء التشغيل."""
+async def prefetch_history() -> None:
     try:
-        for sym in STREAM_SYMBOLS:
-            for tf in ["M15", "H1", "H4"]:
-                data = get_candles(sym, tf, 2000)
+        for sym in S.stream_symbols:
+            for tf in ("M15", "H1", "H4"):
+                data = await asyncio.to_thread(get_candles, sym, tf, 5000)
                 if data:
                     save_candles(sym, tf, data)
-        print(f"[LOAD] [Prefetch] history loaded for {len(STREAM_SYMBOLS)} symbols")
+        print(f"[LOAD] history prefetched for {S.stream_symbols}")
     except Exception as e:
-        print(f"[!] [Prefetch] failed: {e}")
+        print(f"[!] prefetch failed: {e}")
 
-
-# ==================== LIFESPAN ====================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ========== Startup ==========
-    print("[>>] [Startup] initializing...")
+    if S.auth_token in ("change-me", "dev-local-token-change-me", ""):
+        print("[!!] AUTH_TOKEN is still the placeholder — set it in backend/.env")
+        if S.live:
+            raise RuntimeError("refusing to start in LIVE mode with the default auth token")
+    print(f"[>>] starting OmniQuant (mode={S.trading_mode})")
     init_db()
 
     try:
-        init_mt5()
+        await asyncio.to_thread(init_mt5)
         print("[OK] MT5 connected")
     except Exception as e:
         print(f"[!] MT5 not available: {e}")
 
-    # 1. Market Streamer
-    asyncio.create_task(market_streamer())
-    print("[STREAM] [MarketStreamer] loop started")
+    tasks = [
+        asyncio.create_task(market_streamer(), name="market-streamer"),
+        asyncio.create_task(ai_engine.run_loop(), name="ai-engine"),
+        asyncio.create_task(prefetch_history(), name="prefetch"),
+    ]
 
-    # 2. AI Engine
-    asyncio.create_task(ai_engine.run_loop())
-    print("[AI] engine loop started")
-
-    # 3. Trade Logger (اختياري)
     try:
         from trade_logger import trade_logger_loop
-        asyncio.create_task(trade_logger_loop())
-        print("[LOG] [TradeLogger] loop started")
+        tasks.append(asyncio.create_task(trade_logger_loop(), name="trade-logger"))
+        print("[LOG] trade logger started")
     except ImportError:
-        print("[!] [TradeLogger] module not found (skipped)")
+        print("[!] trade_logger module not found (skipped)")
 
-    # 4. Prefetch History
-    asyncio.create_task(prefetch_history())
+    if S.trading_mode.lower() == "live":
+        print("[!!] LIVE TRADING MODE — real orders will be sent to the broker")
 
-    print("[>>] [Startup] all systems ready")
-    yield
+    print("[>>] all systems ready")
+    try:
+        yield
+    finally:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            shutdown_mt5()
+        except Exception:
+            pass
+        print("[STOP] shutdown complete")
 
-    # ========== Shutdown ==========
-    print("[STOP] [Shutdown] stopping...")
-    shutdown_mt5()
-    print("[STOP] [Shutdown] complete")
 
-
-app = FastAPI(title="OmniQuant MVP", version="0.5.0", lifespan=lifespan)
+app = FastAPI(title="OmniQuant MVP", version="0.6.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?",
+    allow_origin_regex=CORS_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -166,13 +188,13 @@ app.add_middleware(
 
 # ==================== AUTH ====================
 
-def verify_token(x_auth_token: Optional[str] = Header(default=None)):
-    if not x_auth_token or x_auth_token != AUTH_TOKEN:
+def verify_token(x_auth_token: Optional[str] = Header(default=None)) -> bool:
+    if not x_auth_token or x_auth_token != S.auth_token:
         raise HTTPException(status_code=401, detail="invalid auth token")
     return True
 
 
-# ==================== Pydantic Models ====================
+# ==================== SCHEMAS ====================
 
 class OpenOrderReq(BaseModel):
     symbol: str
@@ -197,79 +219,115 @@ class ModifyOrderReq(BaseModel):
 class AIConfigReq(BaseModel):
     min_confidence: Optional[float] = None
     lot_size: Optional[float] = None
-    max_concurrent: Optional[int] = None
     interval_sec: Optional[int] = None
+    ml_threshold: Optional[float] = None
+    use_ml: Optional[bool] = None
     symbols: Optional[list[str]] = None
 
 
 class BacktestRequest(BaseModel):
     symbols: Optional[list[str]] = None
     timeframe: str = "H1"
-    min_confidence: float = 0.10
+    spread_points: Optional[float] = None
+    commission_r: Optional[float] = None
+    min_confidence: Optional[float] = None
+    max_concurrent: Optional[int] = None
+    warmup_bars: int = 200
+    step: int = 1
 
 
-# ==================== REST ====================
+class WalkForwardRequest(BaseModel):
+    symbol: str = "XAUUSD"
+    timeframe: str = "H1"
+    n_splits: int = 5
+    tune: bool = False
+
+
+class MonteCarloRequest(BaseModel):
+    symbol: str = "XAUUSD"
+    timeframe: str = "H1"
+    n_sims: int = 300
+    seed: int = 42
+
+
+# ==================== MARKET DATA ====================
 
 @app.get("/api/health")
-def health():
-    return {"status": "ok", "ts": int(time.time()), "kill_enabled": True}
+async def health():
+    killed, why = risk_guard.killed()
+    return {
+        "status": "ok",
+        "version": "0.6.0",
+        "ts": int(time.time()),
+        "trading_mode": S.trading_mode,
+        "kill_switch": killed,
+        "kill_reason": why,
+        # v0.5 hard-coded this to True while no such endpoint existed
+        "kill_endpoint": "/api/risk/kill",
+    }
 
 
 @app.get("/api/config")
 def config():
     return {
-        "max_lot": MAX_LOT_SIZE,
-        "allowed_symbols": sorted(ALLOWED_SYMBOLS) if ALLOWED_SYMBOLS else [],
+        "trading_mode": S.trading_mode,
+        "max_lot": S.max_lot_size,
+        "allowed_symbols": S.allowed_symbols,
+        "allowed_directions": S.allowed_directions or ["BUY", "SELL"],
+        "strategy": {
+            "min_score": S.min_score,
+            "min_confluences": S.min_confluences,
+            "min_confidence": S.min_confidence,
+            "sl_atr_mult": S.sl_atr_mult,
+            "tp_atr_mult": S.tp_atr_mult,
+        },
+        "costs": {"spread_points": S.spread_points, "commission_r": S.commission_r},
     }
 
 
 @app.get("/api/symbols")
-def symbols():
-    return {"symbols": get_symbols()}
+async def symbols():
+    return {"symbols": await asyncio.to_thread(get_symbols)}
 
 
 @app.get("/api/candles")
-def candles(
-    symbol: str = Query(...),
-    timeframe: str = Query("H1"),
-    count: int = Query(500, ge=10, le=5000),
-    persist: bool = Query(True),
-):
-    data = get_candles(symbol, timeframe, count)
+async def candles(symbol: str = Query(...), timeframe: str = Query("H1"),
+                  count: int = Query(500, ge=10, le=20000), persist: bool = Query(True)):
+    data = await asyncio.to_thread(get_candles, symbol, timeframe, count)
     if persist and data:
         save_candles(symbol, timeframe, data)
     return {"symbol": symbol, "timeframe": timeframe, "candles": data}
 
 
 @app.get("/api/account")
-def account():
-    return get_account() or {}
+async def account():
+    return await asyncio.to_thread(get_account) or {}
 
 
 @app.get("/api/positions")
-def positions():
-    return {"positions": get_positions()}
+async def positions():
+    return {"positions": await asyncio.to_thread(get_positions)}
 
 
 @app.get("/api/quote")
-def quote(symbol: str = Query(...)):
-    q = get_quote(symbol)
+async def quote(symbol: str = Query(...)):
+    q = await asyncio.to_thread(get_quote, symbol)
     if q is None:
         raise HTTPException(404, "symbol not found")
-    info = get_symbol_info(symbol) or {}
+    info = await asyncio.to_thread(get_symbol_info, symbol) or {}
     return {**q, "digits": info.get("digits", 5), "point": info.get("point", 0.00001)}
 
 
 @app.get("/api/symbol-info")
-def symbol_info_endpoint(symbol: str = Query(...)):
-    info = get_symbol_info(symbol)
+async def symbol_info_endpoint(symbol: str = Query(...)):
+    info = await asyncio.to_thread(get_symbol_info, symbol)
     if info is None:
         raise HTTPException(404, "symbol not found")
     return info
 
 
 @app.get("/api/signals")
-def signals(limit: int = Query(20, ge=1, le=100)):
+def signals(limit: int = Query(20, ge=1, le=200)):
     return {"signals": get_recent_signals(limit)}
 
 
@@ -285,10 +343,10 @@ def add_signal(payload: dict, _: bool = Depends(verify_token)):
 
 
 @app.get("/api/heatmap")
-def heatmap():
+async def heatmap():
     out = []
-    for sym in HEATMAP_SYMBOLS:
-        c = get_candles(sym, "H1", 24)
+    for sym in S.heatmap_symbols:
+        c = await asyncio.to_thread(get_candles, sym, "H1", 24)
         if not c or len(c) < 2:
             out.append({"symbol": sym, "change_pct": 0.0, "price": 0.0})
             continue
@@ -299,80 +357,89 @@ def heatmap():
 
 
 @app.get("/api/equity-curve")
-def equity_curve():
+async def equity_curve():
+    acc = await asyncio.to_thread(get_account) or {}
     with get_conn() as conn:
-        rows = conn.execute("""
-            SELECT close_time, profit FROM trades
-            WHERE close_time IS NOT NULL
-            ORDER BY close_time ASC
-        """).fetchall()
-    acc = get_account() or {}
-    start_balance = float(acc.get("balance", 0)) - sum(r["profit"] for r in rows)
-    curve, running = [], start_balance
+        rows = conn.execute(
+            "SELECT close_time, profit FROM trades "
+            "WHERE close_time IS NOT NULL ORDER BY close_time ASC"
+        ).fetchall()
+    balance = float(acc.get("balance", 0) or 0)
+    running = balance - sum(float(r["profit"] or 0) for r in rows)
+    curve = []
     for r in rows:
-        running += r["profit"]
+        running += float(r["profit"] or 0)
         curve.append({"time": r["close_time"], "equity": round(running, 2)})
     if not curve and acc:
-        curve = [{"time": int(time.time()), "equity": acc.get("balance", 0)}]
-    return {"curve": curve}
+        curve = [{"time": int(time.time()), "equity": balance}]
+    return {"curve": curve, "note": "reconstructed from closed deals in the local DB"}
 
 
 @app.get("/api/data/stats")
 def data_stats():
     with get_conn() as conn:
-        signals_count = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
-        trades_count = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
-        candles_count = conn.execute("SELECT COUNT(*) FROM candles").fetchone()[0]
-        winning = conn.execute(
-            "SELECT COUNT(*) FROM trades WHERE profit > 0"
-        ).fetchone()[0]
-        total_with_pnl = conn.execute(
-            "SELECT COUNT(*) FROM trades WHERE profit IS NOT NULL"
-        ).fetchone()[0]
-
-    win_rate = (winning / total_with_pnl * 100) if total_with_pnl else 0
-
+        signals = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
+        trades = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+        candles_n = conn.execute("SELECT COUNT(*) FROM candles").fetchone()[0]
+        bt = conn.execute("SELECT COUNT(*) FROM backtest_trades").fetchone()[0]
+        runs = conn.execute("SELECT COUNT(*) FROM backtest_runs").fetchone()[0]
     return {
-        "signals": signals_count,
-        "trades": trades_count,
-        "candles": candles_count,
-        "win_rate": round(win_rate, 1),
-        "ml_ready": signals_count >= 500,
-        "progress_pct": min(round(signals_count / 500 * 100, 1), 100),
+        "signals": signals, "trades": trades, "candles": candles_n,
+        "backtest_trades": bt, "backtest_runs": runs,
+        "ml_min_samples": S.ml_min_samples,
+        "ml_ready": bt >= S.ml_min_samples,
+        "progress_pct": min(round(bt / max(S.ml_min_samples, 1) * 100, 1), 100),
     }
 
 
-# ==================== ORDER EXECUTION ====================
+# ==================== RISK ====================
 
-def _validate_symbol(symbol: str):
-    if ALLOWED_SYMBOLS and symbol not in ALLOWED_SYMBOLS:
-        raise HTTPException(400, f"symbol not allowed: {symbol}")
+@app.get("/api/risk/status")
+async def risk_status():
+    acc = await asyncio.to_thread(get_account)
+    return risk_guard.status(acc)
 
 
-def _validate_volume(volume: float, symbol: str):
-    if volume > MAX_LOT_SIZE:
-        raise HTTPException(400, f"volume {volume} exceeds max {MAX_LOT_SIZE}")
-    info = get_symbol_info(symbol) or {}
-    vmin = info.get("volume_min", 0.01)
-    vmax = info.get("volume_max", 100)
-    vstep = info.get("volume_step", 0.01)
-    if volume < vmin:
-        raise HTTPException(400, f"volume below minimum {vmin}")
-    if volume > vmax:
-        raise HTTPException(400, f"volume above maximum {vmax}")
-    if vstep > 0:
-        rounded = round(volume / vstep) * vstep
-        if abs(rounded - volume) > 1e-8:
-            raise HTTPException(400, f"volume must be multiple of {vstep}")
+@app.post("/api/risk/kill")
+def risk_kill(payload: dict = {}, _: bool = Depends(verify_token)):
+    """Trip the kill switch: no further orders until it is reset."""
+    risk_guard.trip(payload.get("reason", "manual"))
+    return {"ok": True, "killed": True}
 
+
+@app.post("/api/risk/reset")
+def risk_reset(_: bool = Depends(verify_token)):
+    risk_guard.reset()
+    return {"ok": True, "killed": False}
+
+
+@app.get("/api/risk/audit")
+def risk_audit(limit: int = Query(50, ge=1, le=500), _: bool = Depends(verify_token)):
+    return {"items": recent_audit(limit)}
+
+
+# ==================== ORDERS ====================
 
 @app.post("/api/order/open")
-def api_open_order(req: OpenOrderReq, _: bool = Depends(verify_token)):
-    _validate_symbol(req.symbol)
-    _validate_volume(req.volume, req.symbol)
+async def api_open_order(req: OpenOrderReq, _: bool = Depends(verify_token)):
+    positions_now = await asyncio.to_thread(get_positions) or []
+    account_now = await asyncio.to_thread(get_account)
+    info = await asyncio.to_thread(get_symbol_info, req.symbol)
 
-    res = open_market_order(
-        symbol=req.symbol,
+    verdict = risk_guard.check(
+        symbol=req.symbol.upper(),
+        direction=req.direction.upper(),
+        volume=req.volume,
+        positions=positions_now,
+        account=account_now,
+        symbol_info=info,
+    )
+    if not verdict:
+        raise HTTPException(403, verdict.reason)
+
+    res = await asyncio.to_thread(
+        open_market_order,
+        symbol=req.symbol.upper(),
         direction=req.direction.upper(),
         volume=req.volume,
         sl_points=req.sl_points,
@@ -383,40 +450,43 @@ def api_open_order(req: OpenOrderReq, _: bool = Depends(verify_token)):
     if not res.get("ok"):
         raise HTTPException(400, res.get("error") or res.get("comment") or "order failed")
 
-    insert_signal(
-        symbol=req.symbol,
-        direction=req.direction.upper(),
-        price=float(res["price"]),
-        sl=float(res.get("sl", 0)),
-        tp=float(res.get("tp", 0)),
-        confidence=1.0,
-        source="manual",
-    )
+    insert_signal(req.symbol.upper(), req.direction.upper(), float(res["price"]),
+                  float(res.get("sl", 0)), float(res.get("tp", 0)), 1.0, "manual")
+    from database import audit
+    audit("ui", "order.open", req.symbol.upper(),
+          {"direction": req.direction, "volume": req.volume}, res)
     return res
 
 
 @app.post("/api/order/close")
-def api_close_order(req: CloseOrderReq, _: bool = Depends(verify_token)):
-    res = close_position(req.ticket)
+async def api_close_order(req: CloseOrderReq, _: bool = Depends(verify_token)):
+    res = await asyncio.to_thread(close_position, req.ticket)
     if not res.get("ok"):
         raise HTTPException(400, res.get("error") or res.get("comment") or "close failed")
+    from database import audit
+    audit("ui", "order.close", "", {"ticket": req.ticket}, res)
     return res
 
 
 @app.post("/api/order/modify")
-def api_modify_order(req: ModifyOrderReq, _: bool = Depends(verify_token)):
-    res = modify_position(req.ticket, req.sl_points, req.tp_points)
+async def api_modify_order(req: ModifyOrderReq, _: bool = Depends(verify_token)):
+    res = await asyncio.to_thread(modify_position, req.ticket, req.sl_points, req.tp_points)
     if not res.get("ok"):
         raise HTTPException(400, res.get("error") or res.get("comment") or "modify failed")
+    from database import audit
+    audit("ui", "order.modify", "", {"ticket": req.ticket}, res)
     return res
 
 
 @app.post("/api/order/close-all")
-def api_close_all(_: bool = Depends(verify_token)):
-    return close_all_positions()
+async def api_close_all(_: bool = Depends(verify_token)):
+    res = await asyncio.to_thread(close_all_positions)
+    from database import audit
+    audit("ui", "order.close-all", "", {}, res)
+    return res
 
 
-# ==================== AI ENGINE ENDPOINTS ====================
+# ==================== AI ENGINE ====================
 
 @app.get("/api/ai/status")
 def ai_status():
@@ -437,15 +507,20 @@ def ai_stop(_: bool = Depends(verify_token)):
 
 @app.post("/api/ai/auto-execute")
 def ai_auto(payload: dict, _: bool = Depends(verify_token)):
-    enabled = bool(payload.get("enabled", False))
-    ai_engine.set_auto(enabled)
-    return {"ok": True, "auto_execute": enabled}
+    ai_engine.set_auto(bool(payload.get("enabled", False)))
+    return {"ok": True, "auto_execute": ai_engine.auto_execute,
+            "trading_mode": S.trading_mode}
 
 
 @app.post("/api/ai/config")
 def ai_config(req: AIConfigReq, _: bool = Depends(verify_token)):
     ai_engine.update_config(req.dict(exclude_none=True))
     return ai_engine.get_status()
+
+
+@app.post("/api/ai/reload-ml")
+def ai_reload_ml(_: bool = Depends(verify_token)):
+    return ai_engine.reload_ml()
 
 
 @app.get("/api/ai/analysis")
@@ -458,27 +533,93 @@ def ai_decisions(limit: int = 30):
     return {"decisions": ai_engine.get_recent_decisions(limit)}
 
 
-# ==================== BACKTEST ====================
+# ==================== BACKTEST / VALIDATION ====================
 
 @app.post("/api/backtest/run")
-def api_backtest_run(req: BacktestRequest, _: bool = Depends(verify_token)):
-    symbols = req.symbols or STREAM_SYMBOLS
-    stats = run_backtest(
-        symbols=symbols,
+async def api_backtest_run(req: BacktestRequest, _: bool = Depends(verify_token)):
+    """In-sample backtest with costs. Read `verdict` before celebrating anything."""
+    cfg = BacktestConfig.from_settings()
+    if req.spread_points is not None:
+        cfg.spread_points = req.spread_points
+    if req.commission_r is not None:
+        cfg.commission_r = req.commission_r
+    if req.min_confidence is not None:
+        cfg.min_confidence = req.min_confidence
+    if req.max_concurrent is not None:
+        cfg.max_concurrent = req.max_concurrent
+    cfg.warmup_bars = req.warmup_bars
+    cfg.step = max(1, req.step)
+
+    return await asyncio.to_thread(
+        run_backtest,
+        symbols=req.symbols or S.stream_symbols,
         timeframe=req.timeframe,
-        min_confidence=req.min_confidence,
+        config=cfg,
+        persist=True,
     )
-    return stats
 
 
-@app.get("/api/backtest/stats")
-def api_backtest_stats(run_id: Optional[str] = None):
-    return get_backtest_stats(run_id)
+@app.get("/api/backtest/metrics")
+def api_backtest_metrics(run_id: Optional[str] = None, symbol: Optional[str] = None):
+    trades = get_backtest_trades(run_id, limit=20000)
+    if symbol:
+        trades = [t for t in trades if t["symbol"] == symbol.upper()]
+    return compute_metrics(trades)
 
 
 @app.get("/api/backtest/trades")
-def api_backtest_trades(run_id: Optional[str] = None, limit: int = 100):
+def api_backtest_trades(run_id: Optional[str] = None, limit: int = 200):
     return {"trades": get_backtest_trades(run_id, limit)}
+
+
+@app.post("/api/backtest/walkforward")
+async def api_walkforward(req: WalkForwardRequest, _: bool = Depends(verify_token)):
+    """Out-of-sample validation — the number that matters."""
+    from database import load_candles
+    from backtest.walkforward import simple_grid
+
+    candles = load_candles(req.symbol, req.timeframe)
+    if len(candles) < 1000:
+        raise HTTPException(400, f"only {len(candles)} candles cached; "
+                                 f"run download_history.py first")
+    return await asyncio.to_thread(
+        walk_forward,
+        symbol=req.symbol,
+        candles=candles,
+        timeframe=req.timeframe,
+        n_splits=req.n_splits,
+        param_grid=simple_grid() if req.tune else None,
+    )
+
+
+@app.post("/api/backtest/montecarlo")
+async def api_montecarlo(req: MonteCarloRequest, _: bool = Depends(verify_token)):
+    """Compare the strategy against random entries with identical exits."""
+    from database import load_candles
+
+    candles = load_candles(req.symbol, req.timeframe)
+    if len(candles) < 1000:
+        raise HTTPException(400, f"only {len(candles)} candles cached")
+
+    trades = get_backtest_trades(limit=20000)
+    trades = [t for t in trades if t["symbol"] == req.symbol.upper()]
+    actual = (sum(float(t.get("profit_r") or 0) for t in trades) / len(trades)) if trades else 0.0
+    n_trades = len(trades) or 200
+
+    return await asyncio.to_thread(
+        random_benchmark,
+        candles=candles,
+        n_trades=n_trades,
+        sl_atr_mult=S.sl_atr_mult,
+        tp_atr_mult=S.tp_atr_mult,
+        max_bars_held=S.max_bars_held,
+        spread_points=S.spread_points,
+        commission_r=S.commission_r,
+        directions=S.allowed_directions or None,
+        n_sims=req.n_sims,
+        seed=req.seed,
+        actual_expectancy_r=actual,
+    )
 
 
 # ==================== WEBSOCKET ====================
@@ -489,9 +630,10 @@ async def ws_market(ws: WebSocket):
     try:
         await ws.send_text(json.dumps({
             "type": "snapshot",
-            "account": get_account(),
-            "positions": get_positions(),
-            "ticks": [t for t in (get_tick(s) for s in STREAM_SYMBOLS) if t],
+            "account": await asyncio.to_thread(get_account),
+            "positions": await asyncio.to_thread(get_positions),
+            "ticks": [t for t in [await asyncio.to_thread(get_tick, s)
+                                  for s in S.stream_symbols] if t],
         }, default=str))
         while True:
             await ws.receive_text()

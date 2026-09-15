@@ -206,7 +206,16 @@ def analyze_symbol(
     fvg_lookback: int = 10,
     ob_lookback: int = 50,
     ob_min_move_atr: float = 1.2,
+    sl_atr_mult: float | None = None,
+    tp_atr_mult: float | None = None,
+    min_score: float | None = None,
+    min_confluences: int | None = None,
+    stronger_by: float | None = None,
 ) -> SignalResult:
+    """
+    Every threshold is an argument now (v0.5 read them from module globals, so
+    the backtest and the live engine could silently drift apart).
+    """
     if len(candles) < 60:
         return SignalResult(
             symbol=symbol, signal=None, price=0.0,
@@ -311,10 +320,9 @@ def analyze_symbol(
     has_bull_structure = bull_confluences["bos"] or bull_confluences["choch"]
     has_bear_structure = bear_confluences["bos"] or bear_confluences["choch"]
 
-    # قراءة القيم من module-level (قابلة للتعديل من الخارج)
-    min_score = MIN_SCORE
-    min_conf = MIN_CONFLUENCES
-    stronger = STRONGER_BY
+    min_score = MIN_SCORE if min_score is None else min_score
+    min_conf = MIN_CONFLUENCES if min_confluences is None else min_confluences
+    stronger = STRONGER_BY if stronger_by is None else stronger_by
 
     # ✅ شرط رباعي: هيكل + score + عدد تأكيدات + تفوق على الجانب الآخر
     if (has_bull_structure
@@ -341,8 +349,10 @@ def analyze_symbol(
         reasons.append(f"count={bull_count if direction == 'BUY' else bear_count}")
 
     # ===== SL/TP (ATR-based) =====
-    sl_dist = atr_val * 1.5
-    tp_dist = atr_val * 2.5
+    sl_mult = 1.5 if sl_atr_mult is None else sl_atr_mult
+    tp_mult = 2.5 if tp_atr_mult is None else tp_atr_mult
+    sl_dist = atr_val * sl_mult
+    tp_dist = atr_val * tp_mult
 
     if direction == "BUY":
         sl = float(price - sl_dist)
