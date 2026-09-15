@@ -1,9 +1,6 @@
-const API = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
+import { API_URL as API, AUTH_TOKEN } from "@/lib/env";
 
-// Never ship a credential fallback in source: if the variable is missing the
-// request simply 401s instead of silently authenticating against a default
-// token that every clone of this repo shares.
-export const AUTH_TOKEN = process.env.NEXT_PUBLIC_AUTH_TOKEN ?? "";
+export { AUTH_TOKEN, API_URL } from "@/lib/env";
 
 export type Candle = {
   time: number;

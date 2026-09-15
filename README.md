@@ -73,6 +73,40 @@ Then open:
 - <http://127.0.0.1:8000/api/health> — mode, kill-switch state
 - <http://localhost:3000> — dashboard
 
+`frontend/.env.local` is optional in development: without it the frontend falls
+back to `http://127.0.0.1:8000`. It is **required** if the backend runs
+elsewhere, and it is always required for `NEXT_PUBLIC_AUTH_TOKEN`.
+
+### Generating `AUTH_TOKEN`
+
+It is not issued by anyone — **you invent it**. It is a shared secret: the
+backend compares it on every write request, so the same value must appear twice.
+
+```bash
+# pick any of these
+python  -c "import secrets; print(secrets.token_urlsafe(32))"
+openssl rand -hex 32
+```
+
+```
+backend/.env           AUTH_TOKEN=<generated value>
+frontend/.env.local    NEXT_PUBLIC_AUTH_TOKEN=<the same value>
+```
+
+`NEXT_PUBLIC_*` variables are baked in at build time: restart `npm run dev`
+(or rebuild) after editing `.env.local`.
+
+### Troubleshooting the header indicator
+
+| Indicator | Meaning | Fix |
+|---|---|---|
+| `LIVE` (green) | websocket streaming | — |
+| `HALTED` (red) | connected but the kill switch is engaged | `POST /api/risk/reset` or the Risk tab |
+| `API ONLY` (amber) | REST answers, websocket does not | check `WS_URL`, restart the backend, verify nothing else uses port 8000 |
+| `OFFLINE` (red) | backend unreachable | `cd backend && uvicorn main:app --port 8000` (hover the label for the exact URL probed) |
+| `NO TOKEN` (amber) | `NEXT_PUBLIC_AUTH_TOKEN` unset — every button returns 401 | copy `.env.example` → `.env.local`, set the token, restart |
+| `MT5 not available` in the backend log | MetaTrader5 is Windows-only; on macOS/Linux this is expected | run the backend on Windows, or develop against cached candles |
+
 Run the tests (no MT5 needed — the module is stubbed on Linux/macOS):
 
 ```bash

@@ -23,6 +23,8 @@ os.environ.setdefault("AUTH_TOKEN", "test-token")
 os.environ.setdefault("TRADING_MODE", "paper")
 os.environ.setdefault("DB_PATH", "/tmp/omniquant_smoke.db")
 
+pytest.importorskip("fastapi", reason="API smoke tests need fastapi + httpx installed")
+
 from fastapi.testclient import TestClient  # noqa: E402
 
 import core.config  # noqa: E402

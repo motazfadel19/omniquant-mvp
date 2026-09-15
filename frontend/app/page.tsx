@@ -2,6 +2,7 @@
 import { useState } from "react";
 import { useEffect } from "react";
 import { useMarketSocket } from "@/lib/ws";
+import { useHealth } from "@/lib/useHealth";
 import Header from "@/components/Header";
 import CandlesChart from "@/components/CandlesChart";
 import MarketSphere from "@/components/MarketSphere";
@@ -39,6 +40,7 @@ function Tab({
 
 export default function Home() {
   useMarketSocket();
+  useHealth();
   const [mainTab, setMainTab] = useState<MainTab>("chart");
   const [sideTab, setSideTab] = useState<SideTab>("positions");
 

@@ -1,11 +1,11 @@
 "use client";
 import { useEffect, useRef } from "react";
 import { useStore } from "@/store/useStore";
-
-const WS_URL = process.env.NEXT_PUBLIC_WS_URL!;
+import { WS_URL } from "@/lib/env";
 
 export function useMarketSocket() {
   const setConnected = useStore((s) => s.setConnected);
+  const setWsError = useStore((s) => s.setWsError);
   const applyTick = useStore((s) => s.applyTick);
   const retryRef = useRef<ReturnType<typeof setTimeout>>();
 
@@ -14,11 +14,20 @@ export function useMarketSocket() {
     let stopped = false;
 
     const connect = () => {
-      ws = new WebSocket(`${WS_URL}/ws/market`);
+      const url = `${WS_URL}/ws/market`;
+      try {
+        ws = new WebSocket(url);
+      } catch (e) {
+        setConnected(false);
+        setWsError(`cannot open ${url}: ${(e as Error).message}`);
+        if (!stopped) retryRef.current = setTimeout(connect, 3000);
+        return;
+      }
 
       ws.onopen = () => {
         setConnected(true);
-        console.log("🟢 WS connected");
+        setWsError(null);
+        console.log(`[OmniQuant] WS connected: ${url}`);
       };
 
       ws.onmessage = (ev) => {
@@ -36,12 +45,20 @@ export function useMarketSocket() {
         }
       };
 
-      ws.onclose = () => {
+      ws.onclose = (ev) => {
         setConnected(false);
-        if (!stopped) retryRef.current = setTimeout(connect, 2000);
+        setWsError(
+          ev.code
+            ? `websocket closed (code ${ev.code}) — is the backend running on ${WS_URL}?`
+            : `cannot reach ${url}`
+        );
+        if (!stopped) retryRef.current = setTimeout(connect, 3000);
       };
 
-      ws.onerror = () => ws?.close();
+      ws.onerror = () => {
+        setWsError(`cannot reach ${url}`);
+        ws?.close();
+      };
     };
 
     connect();
@@ -50,5 +67,5 @@ export function useMarketSocket() {
       clearTimeout(retryRef.current);
       ws?.close();
     };
-  }, [setConnected, applyTick]);
+  }, [setConnected, setWsError, applyTick]);
 }
