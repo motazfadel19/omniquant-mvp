@@ -19,7 +19,8 @@ from conftest_mt5_stub import install as install_mt5_stub  # noqa: E402
 
 install_mt5_stub()
 
-os.environ.setdefault("AUTH_TOKEN", "test-token")
+TEST_TOKEN = "ci-test-token-" + "x" * 30   # must be >= 24 chars to count as configured
+os.environ.setdefault("AUTH_TOKEN", TEST_TOKEN)
 os.environ.setdefault("TRADING_MODE", "paper")
 os.environ.setdefault("DB_PATH", "/tmp/omniquant_smoke.db")
 
@@ -72,8 +73,23 @@ def test_write_endpoints_require_a_token(client):
     assert client.post("/api/risk/kill").status_code == 401
 
 
+def test_write_endpoints_fail_closed_without_a_real_token(client):
+    """A token copied from .env.example must never authenticate an order."""
+    import main as app_module
+
+    original = app_module.S.auth_token
+    try:
+        for placeholder in ("change-me", "omniquant-local-dev-token", ""):
+            app_module.S.auth_token = placeholder
+            r = client.post("/api/risk/kill", headers={"X-Auth-Token": placeholder})
+            assert r.status_code == 503, placeholder
+            assert "setup_env.py" in r.json()["detail"]
+    finally:
+        app_module.S.auth_token = original
+
+
 def test_kill_switch_round_trip(client):
-    h = {"X-Auth-Token": "test-token"}
+    h = {"X-Auth-Token": TEST_TOKEN}
     assert client.post("/api/risk/kill", json={"reason": "smoke"}, headers=h).status_code == 200
     assert client.get("/api/health").json()["kill_switch"] is True
     assert client.post("/api/risk/reset", headers=h).status_code == 200

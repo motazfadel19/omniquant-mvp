@@ -77,24 +77,28 @@ Then open:
 back to `http://127.0.0.1:8000`. It is **required** if the backend runs
 elsewhere, and it is always required for `NEXT_PUBLIC_AUTH_TOKEN`.
 
-### Generating `AUTH_TOKEN`
+### `AUTH_TOKEN` — one command, no copying
 
-It is not issued by anyone — **you invent it**. It is a shared secret: the
-backend compares it on every write request, so the same value must appear twice.
+The token is a shared secret: the backend compares it on every write request,
+so the same value must exist in two places. **Do not invent it by hand and do
+not copy a value out of `.env.example`** — anything committed to a public
+repository is known to everyone, which is why the examples ship empty.
 
 ```bash
-# pick any of these
-python  -c "import secrets; print(secrets.token_urlsafe(32))"
-openssl rand -hex 32
+python backend/tools/setup_env.py          # generate + write both files
+python backend/tools/setup_env.py --force  # rotate
+python backend/tools/setup_env.py --print  # show the current value
 ```
 
-```
-backend/.env           AUTH_TOKEN=<generated value>
-frontend/.env.local    NEXT_PUBLIC_AUTH_TOKEN=<the same value>
-```
+It writes a `secrets.token_urlsafe(32)` value into `backend/.env`
+(`AUTH_TOKEN`) and `frontend/.env.local` (`NEXT_PUBLIC_AUTH_TOKEN`).
+
+The server **fails closed**: while the token is empty, a placeholder or shorter
+than 24 characters, every write endpoint returns `503` with a pointer to that
+script, and `TRADING_MODE=live` refuses to boot at all.
 
 `NEXT_PUBLIC_*` variables are baked in at build time: restart `npm run dev`
-(or rebuild) after editing `.env.local`.
+(or rebuild) after the token changes.
 
 ### Troubleshooting the header indicator
 
@@ -104,7 +108,7 @@ frontend/.env.local    NEXT_PUBLIC_AUTH_TOKEN=<the same value>
 | `HALTED` (red) | connected but the kill switch is engaged | `POST /api/risk/reset` or the Risk tab |
 | `API ONLY` (amber) | REST answers, websocket does not | check `WS_URL`, restart the backend, verify nothing else uses port 8000 |
 | `OFFLINE` (red) | backend unreachable | `cd backend && uvicorn main:app --port 8000` (hover the label for the exact URL probed) |
-| `NO TOKEN` (amber) | `NEXT_PUBLIC_AUTH_TOKEN` unset — every button returns 401 | copy `.env.example` → `.env.local`, set the token, restart |
+| `NO TOKEN` (amber) | `NEXT_PUBLIC_AUTH_TOKEN` unset — every button returns 401/503 | run `python backend/tools/setup_env.py`, restart `npm run dev` |
 | `MT5 not available` in the backend log | MetaTrader5 is Windows-only; on macOS/Linux this is expected | run the backend on Windows, or develop against cached candles |
 
 Run the tests (no MT5 needed — the module is stubbed on Linux/macOS):

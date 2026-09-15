@@ -106,9 +106,32 @@ class Settings:
     # ---------------- Storage ----------------
     db_path: str = str(BACKEND_DIR / "omniquant.db")
 
+    # Values that mean "the operator never configured a secret".  Compared
+    # case-insensitively.  Keep in sync with tools/setup_env.py.
+    PLACEHOLDER_TOKENS: tuple[str, ...] = (
+        "", "change-me", "changeme", "dev-local-token-change-me",
+        "omniquant-local-dev-token", "your-token-here", "token", "secret",
+    )
+
     @property
     def live(self) -> bool:
         return self.trading_mode.lower() == "live"
+
+    @property
+    def auth_configured(self) -> bool:
+        """A real secret exists (not the sample value, not something trivially short)."""
+        token = (self.auth_token or "").strip()
+        return token.lower() not in self.PLACEHOLDER_TOKENS and len(token) >= 24
+
+    @property
+    def auth_weakness(self) -> str | None:
+        """Why the token is unusable, or None when it is fine."""
+        token = (self.auth_token or "").strip()
+        if not token or token.lower() in self.PLACEHOLDER_TOKENS:
+            return "AUTH_TOKEN is unset or still the sample value"
+        if len(token) < 24:
+            return f"AUTH_TOKEN is only {len(token)} characters (24+ recommended)"
+        return None
 
     def is_symbol_allowed(self, symbol: str) -> bool:
         if not self.allowed_symbols:

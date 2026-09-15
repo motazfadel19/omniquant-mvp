@@ -132,10 +132,11 @@ async def prefetch_history() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if S.auth_token in ("change-me", "dev-local-token-change-me", ""):
-        print("[!!] AUTH_TOKEN is still the placeholder — set it in backend/.env")
+    if S.auth_weakness:
+        print(f"[!!] {S.auth_weakness} — run: python backend/tools/setup_env.py")
+        print("[!!] every write endpoint will return 503 until this is fixed")
         if S.live:
-            raise RuntimeError("refusing to start in LIVE mode with the default auth token")
+            raise RuntimeError("refusing to start in LIVE mode without a real AUTH_TOKEN")
     print(f"[>>] starting OmniQuant (mode={S.trading_mode})")
     init_db()
 
@@ -189,6 +190,17 @@ app.add_middleware(
 # ==================== AUTH ====================
 
 def verify_token(x_auth_token: Optional[str] = Header(default=None)) -> bool:
+    """
+    Fails closed: with no real secret configured on the server, *every* write
+    is refused. A public default copied out of .env.example must never be able
+    to authenticate an order.
+    """
+    if not S.auth_configured:
+        raise HTTPException(
+            status_code=503,
+            detail=(S.auth_weakness or "AUTH_TOKEN is not configured")
+            + " — run: python backend/tools/setup_env.py",
+        )
     if not x_auth_token or x_auth_token != S.auth_token:
         raise HTTPException(status_code=401, detail="invalid auth token")
     return True
